@@ -104,8 +104,8 @@ export function FloatingBetIndicators({ bets, onPress }: Props) {
         ))}
 
         {/* Total count indicator at bottom */}
-        <View className="items-center pt-1 border-t border-border mt-1">
-          <Text className="text-text-subtle text-[10px] font-mono">
+        <View className="items-center pt-1 border-t border-border mt-1 w-11">
+          <Text className="text-text-subtle text-[10px] font-mono text-center">
             {bets.length} active
           </Text>
         </View>
