@@ -12,6 +12,14 @@ import Animated, {
   Extrapolation,
 } from "react-native-reanimated";
 import { Ionicons } from "@expo/vector-icons";
+import { Image } from "react-native";
+
+const TokenIcon = ({ size = 24 }: { size?: number }) => (
+  <Image
+    source={require("../assets/images/token.png")}
+    style={{ width: size, height: size }}
+  />
+);
 
 type BetAmount = 10 | 25 | 50 | 100;
 
@@ -230,13 +238,17 @@ export function PredictionCard({
           Your Balance
         </Text>
         <Animated.View style={animatedBalanceStyle} className="items-center">
-          <Text className="text-3xl font-bold font-mono text-success">
-            $
-            {balance.toLocaleString("en-US", {
-              minimumFractionDigits: 2,
-              maximumFractionDigits: 2,
-            })}
-          </Text>
+          <View className="flex-row items-center">
+            <Text className="text-3xl font-bold font-mono text-success">
+              {balance.toLocaleString("en-US", {
+                minimumFractionDigits: 0,
+                maximumFractionDigits: 0,
+              })}
+            </Text>
+            <View className="ml-2">
+              <TokenIcon size={28} />
+            </View>
+          </View>
         </Animated.View>
       </View>
 
@@ -281,15 +293,20 @@ export function PredictionCard({
                   selectedAmount === amount ? "bg-primary" : "bg-surface-hover"
                 } ${balance < amount ? "opacity-50" : ""}`}
               >
-                <Text
-                  className={`font-mono font-semibold ${
-                    selectedAmount === amount
-                      ? "text-white"
-                      : "text-text-subtle"
-                  }`}
-                >
-                  ${amount}
-                </Text>
+                <View className="flex-row items-center">
+                  <Text
+                    className={`font-mono font-semibold ${
+                      selectedAmount === amount
+                        ? "text-white"
+                        : "text-text-subtle"
+                    }`}
+                  >
+                    {amount}
+                  </Text>
+                  <View className="ml-1">
+                    <TokenIcon size={16} />
+                  </View>
+                </View>
               </Pressable>
             ))}
           </View>

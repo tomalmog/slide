@@ -6,6 +6,7 @@ import {
   Platform,
   useWindowDimensions,
 } from "react-native";
+import { playSound } from "../utils/sounds";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureDetector, Gesture } from "react-native-gesture-handler";
 import Animated, {
@@ -135,11 +136,15 @@ export default function HomeScreen() {
     setCurrentIndex((prev) => (prev + 1) % MOCK_ASSETS.length);
 
     console.log(
-      `Placed ${direction} bet of $${amount} on ${currentAsset.name}`,
+      `Placed ${direction} bet of ${amount} T on ${currentAsset.name}`,
     );
   };
 
-  const handleBetResolved = (betId: string, won: boolean, profit: number) => {
+  const handleBetResolved = async (
+    betId: string,
+    won: boolean,
+    profit: number,
+  ) => {
     const bet = activeBets.find((b) => b.id === betId);
     if (!bet) return;
 
@@ -147,6 +152,7 @@ export default function HomeScreen() {
 
     if (won) {
       setBalance((prev) => prev + bet.amount + profit);
+      playSound("win");
     }
   };
 

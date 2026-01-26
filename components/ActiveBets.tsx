@@ -1,7 +1,14 @@
 import { useState, useEffect } from "react";
-import { View, Text, ScrollView } from "react-native";
+import { View, Text, ScrollView, Image } from "react-native";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
 import { Ionicons } from "@expo/vector-icons";
+
+const TokenIcon = ({ size = 16 }: { size?: number }) => (
+  <Image
+    source={require("../assets/images/token.png")}
+    style={{ width: size, height: size }}
+  />
+);
 
 interface Bet {
   id: string;
@@ -112,9 +119,14 @@ function BetItem({
         <View className="flex-row justify-between">
           <View>
             <Text className="text-text-subtle text-xs">Bet</Text>
-            <Text className="font-mono font-semibold text-sm text-text">
-              ${bet.amount}
-            </Text>
+            <View className="flex-row items-center">
+              <Text className="font-mono font-semibold text-sm text-text">
+                {bet.amount}
+              </Text>
+              <View className="ml-1">
+                <TokenIcon size={14} />
+              </View>
+            </View>
           </View>
           <View>
             <Text className="text-text-subtle text-xs">Entry</Text>
