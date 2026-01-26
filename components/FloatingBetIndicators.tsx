@@ -7,7 +7,7 @@ import Animated, {
   withDelay,
 } from "react-native-reanimated";
 import { Ionicons } from "@expo/vector-icons";
-import { Bet } from "./ActiveBets";
+import { Bet } from "../types";
 
 interface Props {
   bets: Bet[];
