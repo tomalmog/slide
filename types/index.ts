@@ -21,4 +21,4 @@ export interface Bet {
   duration: number;
 }
 
-export type BetAmount = 1 | 5 | 10 | 25;
+export type BetAmount = 10 | 25 | 50 | 100;

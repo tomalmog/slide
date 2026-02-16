@@ -79,7 +79,7 @@ export default function SettingsScreen() {
       <View className="border-b border-border px-4 py-4 flex-row items-center justify-between">
         <View className="flex-row items-center gap-3">
           <Pressable
-            onPress={() => router.back()}
+            onPress={() => router.replace("/")}
             className="w-8 h-8 items-center justify-center"
           >
             <Ionicons name="arrow-back" size={24} color="#FAFAFA" />
@@ -148,7 +148,7 @@ export default function SettingsScreen() {
                 </Pressable>
 
                 <Text className="text-text-subtle text-center text-sm">
-                  Don't have an account?{" "}
+                  Don&apos;t have an account?{" "}
                   <Text className="text-primary">Sign up</Text>
                 </Text>
               </View>
