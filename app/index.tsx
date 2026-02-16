@@ -70,7 +70,7 @@ export default function HomeScreen() {
       amount,
       entryPrice: currentPriceData.price,
       startTime: Date.now(),
-      duration: 10000,
+      duration: 60000,
     };
 
     setBalance((prev) => prev - amount);
