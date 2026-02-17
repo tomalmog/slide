@@ -11,6 +11,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { TokenIcon } from "../components/ui/TokenIcon";
 import {
+  AssetCode,
   BET_AMOUNTS,
   BetAmount,
   MARKET_BY_KEY,
@@ -23,10 +24,12 @@ import {
   TOKEN_TO_USDC_RATE,
 } from "../constants/shorts";
 import { useLiveCryptoPrices } from "../hooks/useLiveCryptoPrices";
+import { usePolymarketChainlinkPrices } from "../hooks/usePolymarketChainlinkPrices";
 import { playSound } from "../utils/sounds";
 
 type Direction = "up" | "down";
 type PositionStatus = "win" | "loss" | "push";
+type FeedStatus = "connecting" | "live" | "offline";
 
 interface MarketRound {
   id: string;
@@ -59,6 +62,11 @@ interface SettledPosition extends OpenPosition {
 interface SettlementEvent {
   roundId: string;
   settlePrice: number;
+}
+
+interface PendingSettlement {
+  roundId: string;
+  asset: AssetCode;
 }
 
 const STARTING_BALANCE = 10000;
@@ -127,12 +135,27 @@ function getMarketTone(asset: "BTC" | "ETH") {
       };
 }
 
+function getStatusColor(status: FeedStatus) {
+  if (status === "live") return "bg-success";
+  if (status === "connecting") return "bg-warning";
+  return "bg-danger";
+}
+
 export default function HomeScreen() {
   const router = useRouter();
   const { width } = useWindowDimensions();
   const useTwoColumns = width >= 1024;
 
-  const { prices, status: priceFeedStatus } = useLiveCryptoPrices();
+  const {
+    prices,
+    status: priceFeedStatus,
+    error: priceFeedError,
+  } = useLiveCryptoPrices();
+  const {
+    prices: chainlinkOraclePrices,
+    status: oracleStatus,
+    error: oracleError,
+  } = usePolymarketChainlinkPrices();
   const [balance, setBalance] = useState(STARTING_BALANCE);
   const [openPositions, setOpenPositions] = useState<OpenPosition[]>([]);
   const [settledPositions, setSettledPositions] = useState<SettledPosition[]>(
@@ -189,6 +212,18 @@ export default function HomeScreen() {
   useEffect(() => {
     roundsRef.current = rounds;
   }, [rounds]);
+  const pendingSettlementsRef = useRef<PendingSettlement[]>([]);
+
+  const oraclePricesRef = useRef<Record<AssetCode, number | null>>({
+    BTC: null,
+    ETH: null,
+  });
+  useEffect(() => {
+    oraclePricesRef.current = {
+      BTC: chainlinkOraclePrices.BTC?.price ?? null,
+      ETH: chainlinkOraclePrices.ETH?.price ?? null,
+    };
+  }, [chainlinkOraclePrices]);
 
   const resolveRounds = useCallback(
     (events: SettlementEvent[], resolvedAt: number) => {
@@ -261,6 +296,33 @@ export default function HomeScreen() {
     [],
   );
 
+  const processPendingSettlements = useCallback(() => {
+    const pending = pendingSettlementsRef.current;
+    if (pending.length === 0) {
+      return;
+    }
+
+    const toResolve: SettlementEvent[] = [];
+    const stillPending: PendingSettlement[] = [];
+
+    for (const item of pending) {
+      const settlePrice = oraclePricesRef.current[item.asset];
+      if (typeof settlePrice === "number") {
+        toResolve.push({
+          roundId: item.roundId,
+          settlePrice,
+        });
+      } else {
+        stillPending.push(item);
+      }
+    }
+
+    pendingSettlementsRef.current = stillPending;
+    if (toResolve.length > 0) {
+      resolveRounds(toResolve, Date.now());
+    }
+  }, [resolveRounds]);
+
   useEffect(() => {
     const interval = setInterval(() => {
       const currentTime = Date.now();
@@ -268,7 +330,7 @@ export default function HomeScreen() {
 
       const currentRounds = roundsRef.current;
       const nextRounds = { ...currentRounds };
-      const settlementEvents: SettlementEvent[] = [];
+      const newSettlements: PendingSettlement[] = [];
       let didChange = false;
 
       for (const market of SHORTS_MARKETS) {
@@ -283,13 +345,10 @@ export default function HomeScreen() {
         const existingRound = currentRounds[market.key];
 
         if (existingRound.id !== expectedRound.id) {
-          const settlementPrice = latestPrice ?? existingRound.openPrice;
-          if (typeof settlementPrice === "number") {
-            settlementEvents.push({
-              roundId: existingRound.id,
-              settlePrice: settlementPrice,
-            });
-          }
+          newSettlements.push({
+            roundId: existingRound.id,
+            asset: market.asset,
+          });
 
           nextRounds[market.key] = expectedRound;
           didChange = true;
@@ -313,16 +372,38 @@ export default function HomeScreen() {
         setRounds(nextRounds);
       }
 
-      if (settlementEvents.length > 0) {
-        resolveRounds(settlementEvents, currentTime);
+      if (newSettlements.length > 0) {
+        const seen = new Set(
+          pendingSettlementsRef.current.map((item) => item.roundId),
+        );
+        const merged = [...pendingSettlementsRef.current];
+
+        for (const item of newSettlements) {
+          if (seen.has(item.roundId)) {
+            continue;
+          }
+          merged.push(item);
+          seen.add(item.roundId);
+        }
+
+        pendingSettlementsRef.current = merged;
+        processPendingSettlements();
       }
     }, ROUND_TICK_MS);
 
     return () => clearInterval(interval);
-  }, [resolveRounds]);
+  }, [processPendingSettlements]);
+
+  useEffect(() => {
+    processPendingSettlements();
+  }, [chainlinkOraclePrices, processPendingSettlements]);
 
   const placePosition = useCallback(
     (marketKey: MarketKey, direction: Direction) => {
+      if (priceFeedStatus !== "live" || oracleStatus !== "live") {
+        return;
+      }
+
       const activeRound = roundsRef.current[marketKey];
       const amount = selectedAmounts[marketKey];
 
@@ -355,7 +436,7 @@ export default function HomeScreen() {
 
       setOpenPositions((previous) => [newPosition, ...previous].slice(0, 120));
     },
-    [selectedAmounts],
+    [oracleStatus, priceFeedStatus, selectedAmounts],
   );
 
   const currentRoundPositionCount = useMemo(() => {
@@ -380,6 +461,8 @@ export default function HomeScreen() {
   );
 
   const usdEquivalent = balance / TOKEN_TO_USDC_RATE;
+  const isTradingEnabled =
+    priceFeedStatus === "live" && oracleStatus === "live";
 
   return (
     <SafeAreaView className="flex-1 bg-background" edges={["top"]}>
@@ -415,19 +498,23 @@ export default function HomeScreen() {
             <Text className="text-text-subtle text-xs tracking-wide uppercase">
               Token Balance
             </Text>
-            <View className="flex-row items-center gap-2">
-              <View
-                className={`w-2.5 h-2.5 rounded-full ${
-                  priceFeedStatus === "live"
-                    ? "bg-success"
-                    : priceFeedStatus === "connecting"
-                      ? "bg-warning"
-                      : "bg-danger"
-                }`}
-              />
-              <Text className="text-text-subtle text-xs uppercase">
-                {priceFeedStatus}
-              </Text>
+            <View className="items-end gap-1">
+              <View className="flex-row items-center gap-2">
+                <View
+                  className={`w-2.5 h-2.5 rounded-full ${getStatusColor(priceFeedStatus)}`}
+                />
+                <Text className="text-text-subtle text-xs uppercase">
+                  Polymarket RTDS {priceFeedStatus}
+                </Text>
+              </View>
+              <View className="flex-row items-center gap-2">
+                <View
+                  className={`w-2.5 h-2.5 rounded-full ${getStatusColor(oracleStatus)}`}
+                />
+                <Text className="text-text-subtle text-xs uppercase">
+                  Polymarket Chainlink {oracleStatus}
+                </Text>
+              </View>
             </View>
           </View>
 
@@ -445,16 +532,46 @@ export default function HomeScreen() {
           </Text>
         </View>
 
+        {!isTradingEnabled && (
+          <View className="bg-danger/15 border border-danger rounded-2xl p-4 gap-2">
+            <View className="flex-row items-center gap-2">
+              <Ionicons name="warning-outline" size={18} color="#EF4444" />
+              <Text className="text-danger font-semibold">Trading Halted</Text>
+            </View>
+            <Text className="text-text text-sm">
+              Shorts requires both Polymarket crypto prices and Polymarket
+              chainlink prices. Betting is disabled until both are live.
+            </Text>
+            {priceFeedError ? (
+              <Text className="text-text-subtle text-xs">{priceFeedError}</Text>
+            ) : null}
+            {oracleError ? (
+              <Text className="text-text-subtle text-xs">{oracleError}</Text>
+            ) : null}
+          </View>
+        )}
+
         <View className="flex-row flex-wrap gap-3">
           {SHORTS_MARKETS.map((market) => {
             const round = rounds[market.key];
             const tone = getMarketTone(market.asset);
-            const marketPrice = prices[market.symbol]?.price ?? round.openPrice;
+            const chainlinkReference =
+              chainlinkOraclePrices[market.asset]?.price ?? null;
+            const liveSpotPrice = prices[market.symbol]?.price ?? null;
+            const marketPrice =
+              liveSpotPrice ?? chainlinkReference ?? round.openPrice;
+            const displayedSource =
+              liveSpotPrice !== null
+                ? `Polymarket crypto_prices (${market.symbol})`
+                : `Polymarket crypto_prices_chainlink (${market.asset}/USD)`;
             const selectedAmount = selectedAmounts[market.key];
             const roundTimeLeftMs = Math.max(0, round.endTime - now);
             const lockTimeLeftMs = Math.max(0, round.lockTime - now);
             const isLocked = lockTimeLeftMs === 0;
-            const canPlace = !isLocked && typeof round.openPrice === "number";
+            const canPlace =
+              isTradingEnabled &&
+              !isLocked &&
+              typeof round.openPrice === "number";
             const roundProgress =
               (roundTimeLeftMs / (market.durationSec * 1000)) * 100;
             const positionsThisRound = currentRoundPositionCount[market.key];
@@ -520,6 +637,15 @@ export default function HomeScreen() {
                       {positionsThisRound} live positions
                     </Text>
                   </View>
+                  <Text className="text-text-subtle text-xs">
+                    Source: {displayedSource}
+                  </Text>
+                  <Text className="text-text-subtle text-xs">
+                    Chainlink ref: ${formatPrice(chainlinkReference)}
+                  </Text>
+                  <Text className="text-text-subtle text-xs">
+                    Spot ref: ${formatPrice(liveSpotPrice)}
+                  </Text>
                 </View>
 
                 <View className="gap-2">
@@ -663,7 +789,9 @@ export default function HomeScreen() {
         <View className="bg-surface border border-border rounded-2xl overflow-hidden">
           <View className="px-4 py-3 border-b border-border flex-row items-center justify-between">
             <Text className="text-text font-semibold">Recent Settlements</Text>
-            <Text className="text-text-subtle text-xs">90% payout on wins</Text>
+            <Text className="text-text-subtle text-xs">
+              Chainlink close • 90% payout
+            </Text>
           </View>
 
           <View className="p-3 gap-2">

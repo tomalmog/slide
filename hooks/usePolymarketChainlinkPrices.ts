@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { MarketSymbol, PRICE_UI_TICK_MS } from "../constants/shorts";
+import { AssetCode, PRICE_UI_TICK_MS } from "../constants/shorts";
 
 type FeedStatus = "connecting" | "live" | "offline";
 
@@ -8,7 +8,7 @@ export interface PricePoint {
   updatedAt: number;
 }
 
-type PriceMap = Record<MarketSymbol, PricePoint | null>;
+type OraclePriceMap = Record<AssetCode, PricePoint | null>;
 
 interface PolymarketPriceTick {
   symbol?: string;
@@ -23,35 +23,34 @@ interface PolymarketPriceTick {
 
 interface PolymarketMessage {
   topic?: string;
-  type?: string;
   payload?: PolymarketPriceTick;
 }
 
 const POLYMARKET_RTDS_URL = "wss://ws-live-data.polymarket.com";
 const RECONNECT_DELAY_MS = 2000;
 
-const INITIAL_PRICES: PriceMap = {
-  BTCUSDT: null,
-  ETHUSDT: null,
+const INITIAL_PRICES: OraclePriceMap = {
+  BTC: null,
+  ETH: null,
 };
 
-function normalizeSymbol(symbol?: string): MarketSymbol | null {
+function normalizeSymbol(symbol?: string): AssetCode | null {
   if (!symbol) {
     return null;
   }
 
-  const normalized = symbol.toUpperCase();
-  if (normalized === "BTCUSDT") {
-    return "BTCUSDT";
+  const normalized = symbol.toLowerCase();
+  if (normalized === "btc/usd") {
+    return "BTC";
   }
-  if (normalized === "ETHUSDT") {
-    return "ETHUSDT";
+  if (normalized === "eth/usd") {
+    return "ETH";
   }
   return null;
 }
 
-function parsePolymarketCryptoPrice(rawData: string): {
-  symbol: MarketSymbol;
+function parseChainlinkPrice(rawData: string): {
+  asset: AssetCode;
   price: number;
   updatedAt: number;
 } | null {
@@ -61,21 +60,21 @@ function parsePolymarketCryptoPrice(rawData: string): {
 
   try {
     const parsed = JSON.parse(rawData) as PolymarketMessage;
-    if (parsed.topic !== "crypto_prices" || !parsed.payload) {
+    const payload = parsed.payload;
+    if (!payload) {
       return null;
     }
 
-    const symbol = normalizeSymbol(parsed.payload.symbol);
-    if (!symbol) {
+    const asset = normalizeSymbol(payload.symbol);
+    if (!asset) {
       return null;
     }
 
-    // Subscription response includes recent history under payload.data.
-    if (Array.isArray(parsed.payload.data) && parsed.payload.data.length > 0) {
-      const lastPoint = parsed.payload.data[parsed.payload.data.length - 1];
+    if (Array.isArray(payload.data) && payload.data.length > 0) {
+      const lastPoint = payload.data[payload.data.length - 1];
       if (typeof lastPoint?.value === "number" && Number.isFinite(lastPoint.value)) {
         return {
-          symbol,
+          asset,
           price: lastPoint.value,
           updatedAt:
             typeof lastPoint.timestamp === "number"
@@ -86,17 +85,17 @@ function parsePolymarketCryptoPrice(rawData: string): {
     }
 
     const directValue =
-      typeof parsed.payload.value === "number"
-        ? parsed.payload.value
-        : typeof parsed.payload.full_accuracy_value === "string"
-          ? Number(parsed.payload.full_accuracy_value)
+      typeof payload.value === "number"
+        ? payload.value
+        : typeof payload.full_accuracy_value === "string"
+          ? Number(payload.full_accuracy_value)
           : NaN;
 
     if (!Number.isFinite(directValue)) {
       return null;
     }
 
-    const rawTimestamp = parsed.payload.timestamp;
+    const rawTimestamp = payload.timestamp;
     const updatedAt =
       typeof rawTimestamp === "number"
         ? rawTimestamp > 1_000_000_000_000
@@ -105,7 +104,7 @@ function parsePolymarketCryptoPrice(rawData: string): {
         : Date.now();
 
     return {
-      symbol,
+      asset,
       price: directValue,
       updatedAt,
     };
@@ -114,16 +113,16 @@ function parsePolymarketCryptoPrice(rawData: string): {
   }
 }
 
-export function useLiveCryptoPrices() {
-  const [prices, setPrices] = useState<PriceMap>(INITIAL_PRICES);
+export function usePolymarketChainlinkPrices() {
+  const [prices, setPrices] = useState<OraclePriceMap>(INITIAL_PRICES);
   const [status, setStatus] = useState<FeedStatus>("connecting");
   const [error, setError] = useState<string | null>(null);
 
-  const bufferedPricesRef = useRef<PriceMap>(INITIAL_PRICES);
+  const bufferedPricesRef = useRef<OraclePriceMap>(INITIAL_PRICES);
   const websocketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
-  const hasReceivedTickerRef = useRef(false);
+  const hasReceivedTickRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -142,17 +141,10 @@ export function useLiveCryptoPrices() {
       }
     };
 
-    const updateBufferedPrice = (
-      symbol: MarketSymbol,
-      price: number,
-      updatedAt: number,
-    ) => {
+    const updateBufferedPrice = (asset: AssetCode, price: number, updatedAt: number) => {
       bufferedPricesRef.current = {
         ...bufferedPricesRef.current,
-        [symbol]: {
-          price,
-          updatedAt,
-        },
+        [asset]: { price, updatedAt },
       };
     };
 
@@ -169,7 +161,7 @@ export function useLiveCryptoPrices() {
 
     const connect = () => {
       clearReconnectTimer();
-      hasReceivedTickerRef.current = false;
+      hasReceivedTickRef.current = false;
       setStatus("connecting");
       setError(null);
 
@@ -186,14 +178,14 @@ export function useLiveCryptoPrices() {
             action: "subscribe",
             subscriptions: [
               {
-                topic: "crypto_prices",
+                topic: "crypto_prices_chainlink",
                 type: "update",
-                filters: JSON.stringify({ symbol: "btcusdt" }),
+                filters: JSON.stringify({ symbol: "btc/usd" }),
               },
               {
-                topic: "crypto_prices",
+                topic: "crypto_prices_chainlink",
                 type: "update",
-                filters: JSON.stringify({ symbol: "ethusdt" }),
+                filters: JSON.stringify({ symbol: "eth/usd" }),
               },
             ],
           }),
@@ -205,18 +197,18 @@ export function useLiveCryptoPrices() {
           return;
         }
 
-        const parsed = parsePolymarketCryptoPrice(event.data);
+        const parsed = parseChainlinkPrice(event.data);
         if (!parsed) {
           return;
         }
 
-        if (!hasReceivedTickerRef.current) {
-          hasReceivedTickerRef.current = true;
+        if (!hasReceivedTickRef.current) {
+          hasReceivedTickRef.current = true;
           setStatus("live");
           setError(null);
         }
 
-        updateBufferedPrice(parsed.symbol, parsed.price, parsed.updatedAt);
+        updateBufferedPrice(parsed.asset, parsed.price, parsed.updatedAt);
       };
 
       socket.onerror = () => {
@@ -224,7 +216,7 @@ export function useLiveCryptoPrices() {
           return;
         }
         setStatus("offline");
-        setError("Polymarket RTDS websocket error.");
+        setError("Polymarket chainlink websocket error.");
       };
 
       socket.onclose = () => {
@@ -232,7 +224,7 @@ export function useLiveCryptoPrices() {
           return;
         }
         setStatus("offline");
-        setError("Polymarket RTDS websocket disconnected.");
+        setError("Polymarket chainlink websocket disconnected.");
         scheduleReconnect();
       };
     };
