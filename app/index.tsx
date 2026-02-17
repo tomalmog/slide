@@ -4,16 +4,16 @@ import {
   Text,
   Pressable,
   ScrollView,
+  NativeSyntheticEvent,
+  NativeScrollEvent,
   useWindowDimensions,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { Ionicons } from "@expo/vector-icons";
+import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { TokenIcon } from "../components/ui/TokenIcon";
 import {
   AssetCode,
-  BET_AMOUNTS,
-  BetAmount,
   MARKET_BY_KEY,
   MarketKey,
   MarketSymbol,
@@ -27,7 +27,6 @@ import { playSound } from "../utils/sounds";
 
 type Direction = "up" | "down";
 type PositionStatus = "win" | "loss" | "push";
-type FeedStatus = "connecting" | "live" | "offline";
 
 interface MarketRound {
   id: string;
@@ -98,6 +97,7 @@ interface MarketQuoteSnapshot {
 }
 
 const STARTING_BALANCE = 10000;
+const DEFAULT_BET_AMOUNT = 50;
 const VIRTUAL_LIQUIDITY = 700;
 const MIN_CONTRACT_CENTS = 5;
 const MAX_ACTIVITY_ITEMS = 10;
@@ -194,6 +194,25 @@ function getLeadingDirection(
   return latestPrice > openPrice ? "up" : "down";
 }
 
+function getCurrentRoundUserPositionCounts(
+  positions: OpenPosition[],
+  rounds: Record<MarketKey, MarketRound>,
+) {
+  const counts = {} as Record<MarketKey, number>;
+  for (const market of SHORTS_MARKETS) {
+    counts[market.key] = 0;
+  }
+
+  for (const position of positions) {
+    const activeRoundId = rounds[position.marketKey]?.id;
+    if (position.roundId === activeRoundId) {
+      counts[position.marketKey] += 1;
+    }
+  }
+
+  return counts;
+}
+
 function getInitialState(timestamp: number) {
   const nextRounds = {} as Record<MarketKey, MarketRound>;
   const nextBooks = {} as Record<MarketKey, MarketBook>;
@@ -268,16 +287,10 @@ function getMarketTone(asset: "BTC" | "ETH") {
       };
 }
 
-function getStatusColor(status: FeedStatus) {
-  if (status === "live") return "bg-success";
-  if (status === "connecting") return "bg-warning";
-  return "bg-danger";
-}
-
 export default function HomeScreen() {
   const router = useRouter();
   const { width } = useWindowDimensions();
-  const useTwoColumns = width >= 1024;
+  const marketCardWidth = Math.max(320, width - 32);
 
   const {
     prices,
@@ -295,22 +308,18 @@ export default function HomeScreen() {
     [],
   );
   const [now, setNow] = useState(Date.now());
-
-  const initialSelectedAmounts = useMemo(() => {
-    const defaults = {} as Record<MarketKey, BetAmount>;
-    for (const market of SHORTS_MARKETS) {
-      defaults[market.key] = 25;
-    }
-    return defaults;
-  }, []);
-  const [selectedAmounts, setSelectedAmounts] = useState<
-    Record<MarketKey, BetAmount>
-  >(initialSelectedAmounts);
+  const [activeMarketIndex, setActiveMarketIndex] = useState(0);
+  const marketScrollRef = useRef<ScrollView | null>(null);
 
   const balanceRef = useRef(balance);
   useEffect(() => {
     balanceRef.current = balance;
   }, [balance]);
+
+  const openPositionsRef = useRef<OpenPosition[]>(openPositions);
+  useEffect(() => {
+    openPositionsRef.current = openPositions;
+  }, [openPositions]);
 
   const latestPricesRef = useRef<Record<MarketSymbol, number | null>>({
     BTCUSDT: null,
@@ -419,6 +428,7 @@ export default function HomeScreen() {
           }
         }
 
+        openPositionsRef.current = stillOpen;
         return stillOpen;
       });
     },
@@ -595,6 +605,57 @@ export default function HomeScreen() {
     return next;
   }, [chainlinkOraclePrices, marketBooks, prices, rounds]);
 
+  const currentRoundPositionCount = useMemo(
+    () => getCurrentRoundUserPositionCounts(openPositions, rounds),
+    [openPositions, rounds],
+  );
+
+  const handleMarketScrollEnd = useCallback(
+    (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const xOffset = event.nativeEvent.contentOffset.x;
+      const nextIndex = clamp(
+        Math.round(xOffset / marketCardWidth),
+        0,
+        SHORTS_MARKETS.length - 1,
+      );
+      setActiveMarketIndex(nextIndex);
+    },
+    [marketCardWidth],
+  );
+
+  const shouldPrioritizeOtherMarkets = useCallback((marketKey: MarketKey) => {
+    const counts = getCurrentRoundUserPositionCounts(
+      openPositionsRef.current,
+      roundsRef.current,
+    );
+
+    if ((counts[marketKey] ?? 0) === 0) {
+      return false;
+    }
+
+    const nowMs = Date.now();
+    for (const market of SHORTS_MARKETS) {
+      if (market.key === marketKey) {
+        continue;
+      }
+
+      const round = roundsRef.current[market.key];
+      if (
+        !round ||
+        typeof round.openPrice !== "number" ||
+        nowMs >= round.endTime
+      ) {
+        continue;
+      }
+
+      if ((counts[market.key] ?? 0) === 0) {
+        return true;
+      }
+    }
+
+    return false;
+  }, []);
+
   const placePosition = useCallback(
     (marketKey: MarketKey, direction: Direction, entryQuote: number) => {
       if (priceFeedStatus !== "live" || oracleStatus !== "live") {
@@ -602,7 +663,7 @@ export default function HomeScreen() {
       }
 
       const activeRound = roundsRef.current[marketKey];
-      const amount = selectedAmounts[marketKey];
+      const amount = DEFAULT_BET_AMOUNT;
       const nowMs = Date.now();
 
       if (!Number.isFinite(entryQuote) || entryQuote <= 0 || entryQuote >= 1) {
@@ -626,6 +687,18 @@ export default function HomeScreen() {
       if (!Number.isFinite(shares) || shares <= 0) {
         return;
       }
+      const previousOpenPositions = openPositionsRef.current;
+
+      const userRoundCounts = getCurrentRoundUserPositionCounts(
+        previousOpenPositions,
+        roundsRef.current,
+      );
+      if (
+        (userRoundCounts[marketKey] ?? 0) > 0 &&
+        shouldPrioritizeOtherMarkets(marketKey)
+      ) {
+        return;
+      }
 
       const nextBalance = balanceRef.current - amount;
       balanceRef.current = nextBalance;
@@ -644,7 +717,11 @@ export default function HomeScreen() {
         shares,
       };
 
-      setOpenPositions((previous) => [newPosition, ...previous].slice(0, 120));
+      setOpenPositions((previous) => {
+        const next = [newPosition, ...previous].slice(0, 120);
+        openPositionsRef.current = next;
+        return next;
+      });
 
       setMarketBooks((previous) => {
         const existing = previous[marketKey];
@@ -679,8 +756,57 @@ export default function HomeScreen() {
         marketBooksRef.current = next;
         return next;
       });
+
+      const countsAfterBet = getCurrentRoundUserPositionCounts(
+        [newPosition, ...previousOpenPositions],
+        roundsRef.current,
+      );
+      const currentIndex = SHORTS_MARKETS.findIndex(
+        (market) => market.key === marketKey,
+      );
+      const findNextIndex = (preferUnbet: boolean) => {
+        for (let offset = 1; offset <= SHORTS_MARKETS.length; offset += 1) {
+          const candidateIndex =
+            (currentIndex + offset) % SHORTS_MARKETS.length;
+          const candidate = SHORTS_MARKETS[candidateIndex];
+          const candidateRound = roundsRef.current[candidate.key];
+          if (
+            !candidateRound ||
+            typeof candidateRound.openPrice !== "number" ||
+            nowMs >= candidateRound.endTime
+          ) {
+            continue;
+          }
+
+          if (preferUnbet && (countsAfterBet[candidate.key] ?? 0) > 0) {
+            continue;
+          }
+
+          return candidateIndex;
+        }
+
+        return -1;
+      };
+
+      let nextIndex = findNextIndex(true);
+      if (nextIndex < 0) {
+        nextIndex = findNextIndex(false);
+      }
+
+      if (nextIndex >= 0) {
+        setActiveMarketIndex(nextIndex);
+        marketScrollRef.current?.scrollTo({
+          x: nextIndex * marketCardWidth,
+          animated: true,
+        });
+      }
     },
-    [oracleStatus, priceFeedStatus, selectedAmounts],
+    [
+      marketCardWidth,
+      oracleStatus,
+      priceFeedStatus,
+      shouldPrioritizeOtherMarkets,
+    ],
   );
 
   const sortedOpenPositions = useMemo(
@@ -688,7 +814,13 @@ export default function HomeScreen() {
     [openPositions],
   );
 
-  const usdEquivalent = balance / TOKEN_TO_USDC_RATE;
+  useEffect(() => {
+    marketScrollRef.current?.scrollTo({
+      x: activeMarketIndex * marketCardWidth,
+      animated: false,
+    });
+  }, [activeMarketIndex, marketCardWidth]);
+
   const isTradingEnabled =
     priceFeedStatus === "live" && oracleStatus === "live";
 
@@ -838,45 +970,6 @@ export default function HomeScreen() {
         className="flex-1"
         contentContainerStyle={{ padding: 16, gap: 16 }}
       >
-        <View className="bg-surface border border-border rounded-2xl p-4 gap-3">
-          <View className="flex-row items-center justify-between">
-            <Text className="text-text-subtle text-xs tracking-wide uppercase">
-              Token Balance
-            </Text>
-            <View className="items-end gap-1">
-              <View className="flex-row items-center gap-2">
-                <View
-                  className={`w-2.5 h-2.5 rounded-full ${getStatusColor(priceFeedStatus)}`}
-                />
-                <Text className="text-text-subtle text-xs uppercase">
-                  Polymarket RTDS {priceFeedStatus}
-                </Text>
-              </View>
-              <View className="flex-row items-center gap-2">
-                <View
-                  className={`w-2.5 h-2.5 rounded-full ${getStatusColor(oracleStatus)}`}
-                />
-                <Text className="text-text-subtle text-xs uppercase">
-                  Polymarket Chainlink {oracleStatus}
-                </Text>
-              </View>
-            </View>
-          </View>
-
-          <View className="flex-row items-center">
-            <Text className="text-text text-3xl font-mono font-bold">
-              {Math.floor(balance).toLocaleString("en-US")}
-            </Text>
-            <View className="ml-2">
-              <TokenIcon size={28} />
-            </View>
-          </View>
-
-          <Text className="text-text-subtle text-sm">
-            Approx ${usdEquivalent.toFixed(2)} USDC at 100 tokens = 1 USDC
-          </Text>
-        </View>
-
         {!isTradingEnabled && (
           <View className="bg-danger/15 border border-danger rounded-2xl p-4 gap-2">
             <View className="flex-row items-center gap-2">
@@ -896,197 +989,166 @@ export default function HomeScreen() {
           </View>
         )}
 
-        <View className="flex-row flex-wrap gap-3">
-          {SHORTS_MARKETS.map((market) => {
-            const round = rounds[market.key];
-            const tone = getMarketTone(market.asset);
-            const quoteSnapshot = marketQuoteSnapshots[market.key];
-            const chainlinkReference =
-              chainlinkOraclePrices[market.asset]?.price ?? null;
-            const liveSpotPrice = prices[market.symbol]?.price ?? null;
-            const marketPrice =
-              liveSpotPrice ?? chainlinkReference ?? round.openPrice;
-            const upQuote = quoteSnapshot?.up ?? 0.5;
-            const downQuote = quoteSnapshot?.down ?? 0.5;
-            const roundVolume =
-              (quoteSnapshot?.upStake ?? 0) + (quoteSnapshot?.downStake ?? 0);
-            const marketActivity = quoteSnapshot?.activity ?? [];
-            const selectedAmount = selectedAmounts[market.key];
-            const roundTimeLeftMs = Math.max(0, round.endTime - now);
-            const canPlace =
-              isTradingEnabled &&
-              roundTimeLeftMs > 0 &&
-              typeof round.openPrice === "number";
-            const roundProgress =
-              (roundTimeLeftMs / (market.durationSec * 1000)) * 100;
+        <View className="gap-2">
+          <ScrollView
+            ref={marketScrollRef}
+            horizontal
+            pagingEnabled
+            decelerationRate="fast"
+            showsHorizontalScrollIndicator={false}
+            onMomentumScrollEnd={handleMarketScrollEnd}
+            scrollEventThrottle={16}
+          >
+            {SHORTS_MARKETS.map((market) => {
+              const round = rounds[market.key];
+              const tone = getMarketTone(market.asset);
+              const quoteSnapshot = marketQuoteSnapshots[market.key];
+              const chainlinkReference =
+                chainlinkOraclePrices[market.asset]?.price ?? null;
+              const liveSpotPrice = prices[market.symbol]?.price ?? null;
+              const marketPrice =
+                liveSpotPrice ?? chainlinkReference ?? round.openPrice;
+              const upQuote = quoteSnapshot?.up ?? 0.5;
+              const downQuote = quoteSnapshot?.down ?? 0.5;
+              const roundVolume =
+                (quoteSnapshot?.upStake ?? 0) + (quoteSnapshot?.downStake ?? 0);
+              const selectedAmount = DEFAULT_BET_AMOUNT;
+              const roundTimeLeftMs = Math.max(0, round.endTime - now);
+              const hasBetThisRound =
+                (currentRoundPositionCount[market.key] ?? 0) > 0;
+              const blockedByRotation =
+                hasBetThisRound && shouldPrioritizeOtherMarkets(market.key);
+              const canPlace =
+                isTradingEnabled &&
+                roundTimeLeftMs > 0 &&
+                typeof round.openPrice === "number" &&
+                !blockedByRotation;
 
-            return (
-              <View
-                key={market.key}
-                style={{ width: useTwoColumns ? "49%" : "100%" }}
-                className={`bg-surface border rounded-2xl p-4 gap-3 ${tone.border}`}
-              >
-                <View className="flex-row items-center justify-between">
-                  <View>
+              return (
+                <View
+                  key={market.key}
+                  style={{ width: marketCardWidth }}
+                  className={`bg-surface border rounded-2xl p-4 gap-3 ${tone.border}`}
+                >
+                  <View className="items-center gap-2">
+                    <View className="flex-row items-center justify-center">
+                      <Text className="text-text text-3xl font-mono font-bold">
+                        {Math.floor(balance).toLocaleString("en-US")}
+                      </Text>
+                      <View className="ml-2">
+                        <TokenIcon size={28} />
+                      </View>
+                    </View>
+                    <View className="w-10 h-10 rounded-full bg-surface-hover border border-border items-center justify-center">
+                      <MaterialCommunityIcons
+                        name={market.asset === "BTC" ? "bitcoin" : "ethereum"}
+                        size={20}
+                        color={market.asset === "BTC" ? "#F59E0B" : "#60A5FA"}
+                      />
+                    </View>
                     <Text className="text-text font-semibold text-base">
                       {market.label}
                     </Text>
                     <Text className="text-text-subtle text-xs">
-                      Round ends in {formatCountdown(roundTimeLeftMs)}
+                      Ends in {formatCountdown(roundTimeLeftMs)}
                     </Text>
                   </View>
-                  <View className={`px-2 py-1 rounded-full ${tone.accent}`}>
-                    <Text className={`text-xs font-semibold ${tone.text}`}>
-                      LIVE
+
+                  <View className="bg-background rounded-xl p-3 border border-border gap-2">
+                    <View className="flex-row items-end justify-between">
+                      <View>
+                        <Text className="text-text-subtle text-xs">
+                          Current
+                        </Text>
+                        <Text className="text-text text-2xl font-mono font-bold">
+                          ${formatPrice(marketPrice)}
+                        </Text>
+                      </View>
+                      <View className="items-end">
+                        <Text className="text-text-subtle text-xs">
+                          Initial
+                        </Text>
+                        <Text className="text-text text-sm font-mono">
+                          ${formatPrice(round.openPrice)}
+                        </Text>
+                      </View>
+                    </View>
+
+                    <View className="flex-row items-center">
+                      <View className="bg-danger/15 border border-danger/30 rounded-lg px-2 py-1">
+                        <Text className="text-danger text-xs font-semibold">
+                          DOWN {formatContractPrice(downQuote)}
+                        </Text>
+                      </View>
+                      <View className="flex-1 items-center">
+                        <Text className="text-text-subtle text-xs">
+                          Vol {Math.round(roundVolume).toLocaleString("en-US")}{" "}
+                          TOK
+                        </Text>
+                      </View>
+                      <View className="bg-success/15 border border-success/30 rounded-lg px-2 py-1">
+                        <Text className="text-success text-xs font-semibold">
+                          UP {formatContractPrice(upQuote)}
+                        </Text>
+                      </View>
+                    </View>
+                  </View>
+
+                  <Text className="text-text-subtle text-xs text-center">
+                    Bet size: {selectedAmount} TOK
+                  </Text>
+
+                  {blockedByRotation ? (
+                    <Text className="text-warning text-xs">
+                      Place at least one bet on other open markets first.
                     </Text>
-                  </View>
-                </View>
+                  ) : null}
 
-                <View className="bg-background rounded-xl p-3 border border-border gap-2">
-                  <View className="flex-row items-end justify-between">
-                    <View>
-                      <Text className="text-text-subtle text-xs">
-                        Live Price
-                      </Text>
-                      <Text className="text-text text-2xl font-mono font-bold">
-                        ${formatPrice(marketPrice)}
-                      </Text>
-                    </View>
-                    <View className="items-end">
-                      <Text className="text-text-subtle text-xs">
-                        Round Open
-                      </Text>
-                      <Text className="text-text text-sm font-mono">
-                        ${formatPrice(round.openPrice)}
-                      </Text>
-                    </View>
-                  </View>
-
-                  <View className="flex-row items-center">
-                    <View className="bg-danger/15 border border-danger/30 rounded-lg px-2 py-1">
-                      <Text className="text-danger text-xs font-semibold">
+                  <View className="flex-row gap-3">
+                    <Pressable
+                      onPress={() =>
+                        placePosition(market.key, "down", downQuote)
+                      }
+                      disabled={!canPlace || balance < selectedAmount}
+                      className={`flex-1 py-3 rounded-xl items-center justify-center flex-row ${
+                        canPlace && balance >= selectedAmount
+                          ? "bg-danger"
+                          : "bg-danger/40"
+                      }`}
+                    >
+                      <Ionicons
+                        name="trending-down"
+                        size={18}
+                        color="#FFFFFF"
+                      />
+                      <Text className="text-white font-semibold ml-2">
                         DOWN {formatContractPrice(downQuote)}
                       </Text>
-                    </View>
-                    <View className="flex-1 items-center">
-                      <Text className="text-text-subtle text-xs">
-                        Vol {Math.round(roundVolume).toLocaleString("en-US")}{" "}
-                        TOK
-                      </Text>
-                    </View>
-                    <View className="bg-success/15 border border-success/30 rounded-lg px-2 py-1">
-                      <Text className="text-success text-xs font-semibold">
+                    </Pressable>
+                    <Pressable
+                      onPress={() => placePosition(market.key, "up", upQuote)}
+                      disabled={!canPlace || balance < selectedAmount}
+                      className={`flex-1 py-3 rounded-xl items-center justify-center flex-row ${
+                        canPlace && balance >= selectedAmount
+                          ? "bg-success"
+                          : "bg-success/40"
+                      }`}
+                    >
+                      <Ionicons name="trending-up" size={18} color="#FFFFFF" />
+                      <Text className="text-white font-semibold ml-2">
                         UP {formatContractPrice(upQuote)}
                       </Text>
-                    </View>
-                  </View>
-
-                  <View className="h-1.5 rounded-full bg-surface-hover overflow-hidden">
-                    <View
-                      className="h-full bg-primary"
-                      style={{
-                        width: `${Math.max(0, Math.min(100, roundProgress))}%`,
-                      }}
-                    />
+                    </Pressable>
                   </View>
                 </View>
-
-                <View className="gap-2">
-                  <View className="flex-row gap-2">
-                    {marketActivity.slice(0, 3).map((trade) => (
-                      <View
-                        key={trade.id}
-                        className="flex-1 bg-surface-hover border border-border rounded-lg px-2 py-1.5"
-                      >
-                        <Text className="text-text-subtle text-xs">
-                          {trade.trader}
-                        </Text>
-                        <Text
-                          className={`text-xs font-semibold ${
-                            trade.side === "up" ? "text-success" : "text-danger"
-                          }`}
-                        >
-                          {trade.side === "up" ? "UP" : "DOWN"}{" "}
-                          {formatContractPrice(trade.quote)}
-                        </Text>
-                      </View>
-                    ))}
-                    {marketActivity.length === 0 ? (
-                      <View className="flex-1 bg-surface-hover border border-border rounded-lg px-2 py-1.5 items-center justify-center">
-                        <Text className="text-text-subtle text-xs">
-                          No recent bets
-                        </Text>
-                      </View>
-                    ) : null}
-                  </View>
-                  <View className="flex-row gap-2">
-                    {BET_AMOUNTS.map((amount) => (
-                      <Pressable
-                        key={amount}
-                        onPress={() =>
-                          setSelectedAmounts((previous) => ({
-                            ...previous,
-                            [market.key]: amount,
-                          }))
-                        }
-                        className={`flex-1 py-2 rounded-lg border items-center ${
-                          selectedAmount === amount
-                            ? "bg-primary border-primary"
-                            : "bg-surface-hover border-border"
-                        }`}
-                      >
-                        <View className="flex-row items-center">
-                          <Text
-                            className={`font-mono font-semibold ${
-                              selectedAmount === amount
-                                ? "text-white"
-                                : "text-text"
-                            }`}
-                          >
-                            {amount}
-                          </Text>
-                          <View className="ml-1">
-                            <TokenIcon size={14} />
-                          </View>
-                        </View>
-                      </Pressable>
-                    ))}
-                  </View>
-                </View>
-
-                <View className="flex-row gap-3">
-                  <Pressable
-                    onPress={() => placePosition(market.key, "down", downQuote)}
-                    disabled={!canPlace || balance < selectedAmount}
-                    className={`flex-1 py-3 rounded-xl items-center justify-center flex-row ${
-                      canPlace && balance >= selectedAmount
-                        ? "bg-danger"
-                        : "bg-danger/40"
-                    }`}
-                  >
-                    <Ionicons name="trending-down" size={18} color="#FFFFFF" />
-                    <Text className="text-white font-semibold ml-2">
-                      DOWN {formatContractPrice(downQuote)}
-                    </Text>
-                  </Pressable>
-                  <Pressable
-                    onPress={() => placePosition(market.key, "up", upQuote)}
-                    disabled={!canPlace || balance < selectedAmount}
-                    className={`flex-1 py-3 rounded-xl items-center justify-center flex-row ${
-                      canPlace && balance >= selectedAmount
-                        ? "bg-success"
-                        : "bg-success/40"
-                    }`}
-                  >
-                    <Ionicons name="trending-up" size={18} color="#FFFFFF" />
-                    <Text className="text-white font-semibold ml-2">
-                      UP {formatContractPrice(upQuote)}
-                    </Text>
-                  </Pressable>
-                </View>
-              </View>
-            );
-          })}
+              );
+            })}
+          </ScrollView>
+          <View className="items-center">
+            <Text className="text-text-subtle text-xs">
+              {activeMarketIndex + 1} / {SHORTS_MARKETS.length}
+            </Text>
+          </View>
         </View>
 
         <View className="bg-surface border border-border rounded-2xl overflow-hidden">
