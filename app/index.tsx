@@ -9,11 +9,13 @@ import {
   useWindowDimensions,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
+import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
+import Svg, { Circle, Line, Path, Text as SvgText } from "react-native-svg";
 import { TokenIcon } from "../components/ui/TokenIcon";
 import {
   AssetCode,
+  MARKET_BY_ASSET,
   MARKET_BY_KEY,
   MarketKey,
   MarketSymbol,
@@ -22,7 +24,9 @@ import {
   TOKEN_TO_USDC_RATE,
 } from "../constants/shorts";
 import { useLiveCryptoPrices } from "../hooks/useLiveCryptoPrices";
-import { usePolymarketChainlinkPrices } from "../hooks/usePolymarketChainlinkPrices";
+import { useSettledPositions } from "../contexts/SettledPositionsContext";
+import { useBotSimulation } from "../hooks/useBotSimulation";
+import { getUpProbability } from "../utils/quoteProbability";
 import { playSound } from "../utils/sounds";
 
 type Direction = "up" | "down";
@@ -96,26 +100,53 @@ interface MarketQuoteSnapshot {
   activity: MarketActivity[];
 }
 
+interface PriceSample {
+  timestamp: number;
+  price: number;
+}
+
+interface ChartTimeMarker {
+  id: string;
+  x: number;
+  label: string;
+  textAnchor: "start" | "middle" | "end";
+}
+
 const STARTING_BALANCE = 10000;
 const DEFAULT_BET_AMOUNT = 50;
-const VIRTUAL_LIQUIDITY = 700;
-const MIN_CONTRACT_CENTS = 5;
+const MIN_CONTRACT_CENTS = 15;
+const CHART_SAMPLE_MS = 250;
+const MAX_CHART_POINTS = 220;
+const CHART_WINDOW_MS = 50000;
+const CHART_TIME_MARKER_MS = 10000;
+const CHART_CURRENT_MARKER_DELAY_MS = 2000;
+const CHART_VIEWBOX_WIDTH = 320;
+const CHART_VIEWBOX_HEIGHT = 130;
+const CHART_PLOT_WIDTH = 268;
+const CHART_AXIS_GAP = 4;
+const CHART_Y_LABEL_X = CHART_PLOT_WIDTH + CHART_AXIS_GAP;
 const MAX_ACTIVITY_ITEMS = 10;
-const FAKE_BET_TICK_MS = 700;
-const BOT_WINNER_BIAS = 0.72;
-const BOT_MARKET_ACTIVE_PROBABILITY = 0.88;
-const BOT_BETS_PER_TICK_MIN = 3;
-const BOT_BETS_PER_TICK_MAX = 8;
-const FAKE_BET_SIZES = [10, 25, 50, 100, 150, 250] as const;
-const FAKE_TRADER_IDS = [
-  "0xA1c3",
-  "0xB4e7",
-  "0xC9f2",
-  "0xD17b",
-  "0xE6a0",
-  "0xF2d4",
-  "0x91af",
-  "0x73ce",
+const MARKET_TONES = [
+  {
+    border: "border-warning/40",
+    accent: "bg-warning/15",
+    text: "text-warning",
+  },
+  {
+    border: "border-primary/40",
+    accent: "bg-primary/15",
+    text: "text-primary",
+  },
+  {
+    border: "border-success/40",
+    accent: "bg-success/15",
+    text: "text-success",
+  },
+  {
+    border: "border-danger/40",
+    accent: "bg-danger/15",
+    text: "text-danger",
+  },
 ] as const;
 
 function clamp(value: number, min: number, max: number) {
@@ -159,12 +190,29 @@ function formatPrice(price: number | null) {
   return price.toFixed(4);
 }
 
+function formatAxisPrice(price: number) {
+  if (price >= 1000) {
+    return price.toLocaleString("en-US", {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0,
+    });
+  }
+  return price.toFixed(2);
+}
+
 function formatCountdown(ms: number) {
   const safeMs = Math.max(0, ms);
   const totalSeconds = Math.ceil(safeMs / 1000);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function formatChartTime(timestamp: number) {
+  const date = new Date(timestamp);
+  const minutes = date.getMinutes().toString().padStart(2, "0");
+  const seconds = date.getSeconds().toString().padStart(2, "0");
+  return `${minutes}:${seconds}`;
 }
 
 function roundToTwo(value: number) {
@@ -177,21 +225,6 @@ function roundToFour(value: number) {
 
 function formatContractPrice(price: number) {
   return `$${price.toFixed(2)}`;
-}
-
-function getLeadingDirection(
-  openPrice: number | null,
-  latestPrice: number | null,
-): Direction | null {
-  if (
-    typeof openPrice !== "number" ||
-    typeof latestPrice !== "number" ||
-    openPrice === latestPrice
-  ) {
-    return null;
-  }
-
-  return latestPrice > openPrice ? "up" : "down";
 }
 
 function getCurrentRoundUserPositionCounts(
@@ -241,27 +274,89 @@ function getInitialState(timestamp: number) {
   };
 }
 
+function getInitialLatestPriceMap() {
+  const next = {} as Record<MarketSymbol, number | null>;
+  for (const market of SHORTS_MARKETS) {
+    next[market.symbol] = null;
+  }
+  return next;
+}
+
+function buildChartPath(points: { x: number; y: number }[]) {
+  if (points.length === 0) {
+    return "";
+  }
+
+  return points
+    .map(
+      (point, index) =>
+        `${index === 0 ? "M" : "L"}${point.x.toFixed(2)} ${point.y.toFixed(2)}`,
+    )
+    .join(" ");
+}
+
+function buildWindowSeries(
+  samples: PriceSample[],
+  windowStart: number,
+  windowEnd: number,
+  sampleStepMs: number,
+): PriceSample[] {
+  if (samples.length === 0) {
+    return [];
+  }
+
+  const sortedSamples = [...samples].sort(
+    (firstSample, secondSample) =>
+      firstSample.timestamp - secondSample.timestamp,
+  );
+  const filledSamples: PriceSample[] = [];
+  let sourceIndex = 0;
+  let latestPrice = sortedSamples[0].price;
+
+  for (
+    let timestamp = windowStart;
+    timestamp <= windowEnd;
+    timestamp += sampleStepMs
+  ) {
+    while (
+      sourceIndex < sortedSamples.length &&
+      sortedSamples[sourceIndex].timestamp <= timestamp
+    ) {
+      latestPrice = sortedSamples[sourceIndex].price;
+      sourceIndex += 1;
+    }
+
+    filledSamples.push({ timestamp, price: latestPrice });
+  }
+
+  if (
+    filledSamples.length === 0 ||
+    filledSamples[filledSamples.length - 1].timestamp < windowEnd
+  ) {
+    filledSamples.push({ timestamp: windowEnd, price: latestPrice });
+  }
+
+  return filledSamples.slice(-MAX_CHART_POINTS);
+}
+
 function getContractQuotes(
   openPrice: number | null,
   latestPrice: number | null,
-  upStake: number,
-  downStake: number,
+  _upStake: number,
+  _downStake: number,
+  _asset: AssetCode = "BTC",
+  roundProgress: number = 0.5,
+  roundDurationMs: number = 30000,
 ) {
-  const trendSignal =
-    typeof openPrice === "number" &&
-    typeof latestPrice === "number" &&
-    openPrice > 0
-      ? clamp(((latestPrice - openPrice) / openPrice) * 25, -0.28, 0.28)
-      : 0;
-
-  const trendProbability = clamp(0.5 + trendSignal, 0.2, 0.8);
-  const virtualUp = VIRTUAL_LIQUIDITY * trendProbability;
-  const virtualDown = VIRTUAL_LIQUIDITY * (1 - trendProbability);
-  const rawUp =
-    (virtualUp + upStake) / (virtualUp + virtualDown + upStake + downStake);
+  const upProbability = getUpProbability({
+    openPrice,
+    latestPrice,
+    roundProgress,
+    roundDurationMs,
+  });
 
   const upCents = clamp(
-    Math.round(rawUp * 100),
+    Math.round(upProbability * 100),
     MIN_CONTRACT_CENTS,
     100 - MIN_CONTRACT_CENTS,
   );
@@ -273,18 +368,8 @@ function getContractQuotes(
   };
 }
 
-function getMarketTone(asset: "BTC" | "ETH") {
-  return asset === "BTC"
-    ? {
-        border: "border-warning/40",
-        accent: "bg-warning/15",
-        text: "text-warning",
-      }
-    : {
-        border: "border-primary/40",
-        accent: "bg-primary/15",
-        text: "text-primary",
-      };
+function getMarketTone(marketIndex: number) {
+  return MARKET_TONES[marketIndex % MARKET_TONES.length];
 }
 
 export default function HomeScreen() {
@@ -294,20 +379,15 @@ export default function HomeScreen() {
 
   const {
     prices,
+    history: livePriceHistory,
     status: priceFeedStatus,
     error: priceFeedError,
   } = useLiveCryptoPrices();
-  const {
-    prices: chainlinkOraclePrices,
-    status: oracleStatus,
-    error: oracleError,
-  } = usePolymarketChainlinkPrices();
   const [balance, setBalance] = useState(STARTING_BALANCE);
   const [openPositions, setOpenPositions] = useState<OpenPosition[]>([]);
-  const [settledPositions, setSettledPositions] = useState<SettledPosition[]>(
-    [],
-  );
+  const { setSettledPositions } = useSettledPositions();
   const [now, setNow] = useState(Date.now());
+  const [positionsExpanded, setPositionsExpanded] = useState(false);
   const [activeMarketIndex, setActiveMarketIndex] = useState(0);
   const marketScrollRef = useRef<ScrollView | null>(null);
 
@@ -321,19 +401,19 @@ export default function HomeScreen() {
     openPositionsRef.current = openPositions;
   }, [openPositions]);
 
-  const latestPricesRef = useRef<Record<MarketSymbol, number | null>>({
-    BTCUSDT: null,
-    ETHUSDT: null,
-  });
+  const latestPricesRef = useRef<Record<MarketSymbol, number | null>>(
+    getInitialLatestPriceMap(),
+  );
 
+  // Single market data source: live Binance feed.
   useEffect(() => {
-    const btcPrice = prices.BTCUSDT?.price ?? null;
-    const ethPrice = prices.ETHUSDT?.price ?? null;
-
-    latestPricesRef.current = {
-      BTCUSDT: btcPrice ?? latestPricesRef.current.BTCUSDT,
-      ETHUSDT: ethPrice ?? latestPricesRef.current.ETHUSDT,
-    };
+    const nextLatestPrices = { ...latestPricesRef.current };
+    for (const market of SHORTS_MARKETS) {
+      const spotPrice = prices[market.symbol]?.price ?? null;
+      nextLatestPrices[market.symbol] =
+        spotPrice ?? nextLatestPrices[market.symbol];
+    }
+    latestPricesRef.current = nextLatestPrices;
   }, [prices]);
 
   const initialState = useMemo(() => getInitialState(Date.now()), []);
@@ -354,17 +434,6 @@ export default function HomeScreen() {
   }, [marketBooks]);
   const pendingSettlementsRef = useRef<PendingSettlement[]>([]);
 
-  const oraclePricesRef = useRef<Record<AssetCode, number | null>>({
-    BTC: null,
-    ETH: null,
-  });
-  useEffect(() => {
-    oraclePricesRef.current = {
-      BTC: chainlinkOraclePrices.BTC?.price ?? null,
-      ETH: chainlinkOraclePrices.ETH?.price ?? null,
-    };
-  }, [chainlinkOraclePrices]);
-
   const resolveRounds = useCallback(
     (events: SettlementEvent[], resolvedAt: number) => {
       if (events.length === 0) {
@@ -376,63 +445,64 @@ export default function HomeScreen() {
         eventMap.set(event.roundId, event.settlePrice);
       }
 
-      setOpenPositions((previousOpen) => {
-        let payoutTotal = 0;
-        const resolved: SettledPosition[] = [];
-        const stillOpen: OpenPosition[] = [];
+      const previousOpen = openPositionsRef.current;
+      let payoutTotal = 0;
+      const resolved: SettledPosition[] = [];
+      const stillOpen: OpenPosition[] = [];
 
-        for (const position of previousOpen) {
-          const settlePrice = eventMap.get(position.roundId);
-          if (typeof settlePrice !== "number") {
-            stillOpen.push(position);
-            continue;
-          }
-
-          const isWin =
-            position.direction === "up"
-              ? settlePrice > position.entryPrice
-              : settlePrice < position.entryPrice;
-          const isPush = settlePrice === position.entryPrice;
-          const payout = isPush
-            ? position.amount
-            : isWin
-              ? roundToTwo(position.shares * TOKEN_TO_USDC_RATE)
-              : 0;
-          const profit = roundToTwo(payout - position.amount);
-
-          payoutTotal += payout;
-          resolved.push({
-            ...position,
-            status: isPush ? "push" : isWin ? "win" : "loss",
-            settlePrice,
-            profit,
-            payout,
-            resolvedAt,
-          });
+      for (const position of previousOpen) {
+        const settlePrice = eventMap.get(position.roundId);
+        if (typeof settlePrice !== "number") {
+          stillOpen.push(position);
+          continue;
         }
 
-        if (resolved.length > 0) {
-          const nextBalance = balanceRef.current + payoutTotal;
-          balanceRef.current = nextBalance;
-          setBalance(nextBalance);
+        const isWin =
+          position.direction === "up"
+            ? settlePrice > position.entryPrice
+            : settlePrice < position.entryPrice;
+        const isPush = settlePrice === position.entryPrice;
+        const payout = isPush
+          ? position.amount
+          : isWin
+            ? roundToTwo(position.shares * TOKEN_TO_USDC_RATE)
+            : 0;
+        const profit = roundToTwo(payout - position.amount);
 
-          setSettledPositions((previousSettled) =>
-            [
-              ...resolved.sort((a, b) => b.resolvedAt - a.resolvedAt),
-              ...previousSettled,
-            ].slice(0, 40),
-          );
+        payoutTotal += payout;
+        resolved.push({
+          ...position,
+          status: isPush ? "push" : isWin ? "win" : "loss",
+          settlePrice,
+          profit,
+          payout,
+          resolvedAt,
+        });
+      }
 
-          if (resolved.some((position) => position.status === "win")) {
-            void playSound("win").catch(() => undefined);
-          }
-        }
+      if (resolved.length === 0) {
+        return;
+      }
 
-        openPositionsRef.current = stillOpen;
-        return stillOpen;
-      });
+      openPositionsRef.current = stillOpen;
+      setOpenPositions(stillOpen);
+
+      const nextBalance = balanceRef.current + payoutTotal;
+      balanceRef.current = nextBalance;
+      setBalance(nextBalance);
+
+      setSettledPositions((previousSettled) =>
+        [
+          ...resolved.sort((a, b) => b.resolvedAt - a.resolvedAt),
+          ...previousSettled,
+        ].slice(0, 40),
+      );
+
+      if (resolved.some((position) => position.status === "win")) {
+        void playSound("win").catch(() => undefined);
+      }
     },
-    [],
+    [setSettledPositions],
   );
 
   const processPendingSettlements = useCallback(() => {
@@ -445,7 +515,8 @@ export default function HomeScreen() {
     const stillPending: PendingSettlement[] = [];
 
     for (const item of pending) {
-      const settlePrice = oraclePricesRef.current[item.asset];
+      const fallbackMarket = MARKET_BY_ASSET[item.asset];
+      const settlePrice = latestPricesRef.current[fallbackMarket.symbol];
       if (typeof settlePrice === "number") {
         toResolve.push({
           roundId: item.roundId,
@@ -564,7 +635,7 @@ export default function HomeScreen() {
 
   useEffect(() => {
     processPendingSettlements();
-  }, [chainlinkOraclePrices, processPendingSettlements]);
+  }, [prices, processPendingSettlements]);
 
   const marketQuoteSnapshots = useMemo(() => {
     const next = {} as Record<MarketKey, MarketQuoteSnapshot>;
@@ -581,14 +652,20 @@ export default function HomeScreen() {
       };
 
       const latestUnderlyingPrice =
-        prices[market.symbol]?.price ??
-        chainlinkOraclePrices[market.asset]?.price ??
-        round.openPrice;
+        prices[market.symbol]?.price ?? round.openPrice;
+      const roundDuration = round.endTime - round.startTime;
+      const roundProgress =
+        roundDuration > 0
+          ? Math.min(1, Math.max(0, (now - round.startTime) / roundDuration))
+          : 0.5;
       const quotes = getContractQuotes(
         round.openPrice,
         latestUnderlyingPrice,
         book.upStake,
         book.downStake,
+        market.asset,
+        roundProgress,
+        roundDuration,
       );
 
       next[market.key] = {
@@ -603,7 +680,7 @@ export default function HomeScreen() {
     }
 
     return next;
-  }, [chainlinkOraclePrices, marketBooks, prices, rounds]);
+  }, [marketBooks, now, prices, rounds]);
 
   const currentRoundPositionCount = useMemo(
     () => getCurrentRoundUserPositionCounts(openPositions, rounds),
@@ -658,7 +735,7 @@ export default function HomeScreen() {
 
   const placePosition = useCallback(
     (marketKey: MarketKey, direction: Direction, entryQuote: number) => {
-      if (priceFeedStatus !== "live" || oracleStatus !== "live") {
+      if (priceFeedStatus !== "live") {
         return;
       }
 
@@ -801,12 +878,7 @@ export default function HomeScreen() {
         });
       }
     },
-    [
-      marketCardWidth,
-      oracleStatus,
-      priceFeedStatus,
-      shouldPrioritizeOtherMarkets,
-    ],
+    [marketCardWidth, priceFeedStatus, shouldPrioritizeOtherMarkets],
   );
 
   const sortedOpenPositions = useMemo(
@@ -821,125 +893,16 @@ export default function HomeScreen() {
     });
   }, [activeMarketIndex, marketCardWidth]);
 
-  const isTradingEnabled =
-    priceFeedStatus === "live" && oracleStatus === "live";
+  const isTradingEnabled = priceFeedStatus === "live";
 
-  useEffect(() => {
-    if (!isTradingEnabled) {
-      return;
-    }
-
-    const interval = setInterval(() => {
-      const currentTime = Date.now();
-      const currentBooks = marketBooksRef.current;
-      const currentRounds = roundsRef.current;
-      const nextBooks = { ...currentBooks };
-      let didChangeBooks = false;
-
-      for (const market of SHORTS_MARKETS) {
-        if (Math.random() > BOT_MARKET_ACTIVE_PROBABILITY) {
-          continue;
-        }
-
-        const round = currentRounds[market.key];
-        if (!round || currentTime >= round.endTime) {
-          continue;
-        }
-
-        const existing = nextBooks[market.key] ?? {
-          roundId: round.id,
-          upStake: 0,
-          downStake: 0,
-          upPositions: 0,
-          downPositions: 0,
-          activity: [],
-        };
-        let currentBook =
-          existing.roundId === round.id
-            ? existing
-            : {
-                roundId: round.id,
-                upStake: 0,
-                downStake: 0,
-                upPositions: 0,
-                downPositions: 0,
-                activity: [],
-              };
-
-        const betCount =
-          BOT_BETS_PER_TICK_MIN +
-          Math.floor(
-            Math.random() * (BOT_BETS_PER_TICK_MAX - BOT_BETS_PER_TICK_MIN + 1),
-          );
-
-        for (let index = 0; index < betCount; index += 1) {
-          const latestUnderlying =
-            latestPricesRef.current[market.symbol] ??
-            oraclePricesRef.current[market.asset] ??
-            round.openPrice;
-          const leadingDirection = getLeadingDirection(
-            round.openPrice,
-            latestUnderlying,
-          );
-          const quotes = getContractQuotes(
-            round.openPrice,
-            latestUnderlying,
-            currentBook.upStake,
-            currentBook.downStake,
-          );
-
-          let side: Direction;
-          if (leadingDirection) {
-            side =
-              Math.random() < BOT_WINNER_BIAS
-                ? leadingDirection
-                : leadingDirection === "up"
-                  ? "down"
-                  : "up";
-          } else {
-            side = Math.random() < quotes.up ? "up" : "down";
-          }
-
-          const quote = side === "up" ? quotes.up : quotes.down;
-          const amount =
-            FAKE_BET_SIZES[Math.floor(Math.random() * FAKE_BET_SIZES.length)];
-          const trader =
-            FAKE_TRADER_IDS[Math.floor(Math.random() * FAKE_TRADER_IDS.length)];
-
-          currentBook = {
-            ...currentBook,
-            upStake: currentBook.upStake + (side === "up" ? amount : 0),
-            downStake: currentBook.downStake + (side === "down" ? amount : 0),
-            upPositions: currentBook.upPositions + (side === "up" ? 1 : 0),
-            downPositions:
-              currentBook.downPositions + (side === "down" ? 1 : 0),
-            activity: [
-              {
-                id: `sim-${market.key}-${currentTime}-${index}-${Math.random().toString(36).slice(2, 6)}`,
-                side,
-                amount,
-                quote,
-                createdAt: currentTime,
-                trader,
-                isUser: false,
-              },
-              ...currentBook.activity,
-            ].slice(0, MAX_ACTIVITY_ITEMS),
-          };
-        }
-
-        nextBooks[market.key] = currentBook;
-        didChangeBooks = true;
-      }
-
-      if (didChangeBooks) {
-        marketBooksRef.current = nextBooks;
-        setMarketBooks(nextBooks);
-      }
-    }, FAKE_BET_TICK_MS);
-
-    return () => clearInterval(interval);
-  }, [isTradingEnabled]);
+  useBotSimulation({
+    roundsRef,
+    marketBooksRef,
+    latestPricesRef,
+    getContractQuotes,
+    setMarketBooks,
+    enabled: isTradingEnabled,
+  });
 
   return (
     <SafeAreaView className="flex-1 bg-background" edges={["top"]}>
@@ -958,12 +921,20 @@ export default function HomeScreen() {
           </View>
         </View>
 
-        <Pressable
-          onPress={() => router.push("/settings")}
-          className="bg-surface-hover border border-border rounded-lg p-2"
-        >
-          <Ionicons name="settings-outline" size={20} color="#FAFAFA" />
-        </Pressable>
+        <View className="flex-row items-center gap-2">
+          <Pressable
+            onPress={() => router.push("/settlements")}
+            className="bg-surface-hover border border-border rounded-lg p-2"
+          >
+            <Ionicons name="receipt-outline" size={20} color="#FAFAFA" />
+          </Pressable>
+          <Pressable
+            onPress={() => router.push("/settings")}
+            className="bg-surface-hover border border-border rounded-lg p-2"
+          >
+            <Ionicons name="settings-outline" size={20} color="#FAFAFA" />
+          </Pressable>
+        </View>
       </View>
 
       <ScrollView
@@ -977,14 +948,11 @@ export default function HomeScreen() {
               <Text className="text-danger font-semibold">Trading Halted</Text>
             </View>
             <Text className="text-text text-sm">
-              Shorts requires both Polymarket crypto prices and Polymarket
-              chainlink prices. Betting is disabled until both are live.
+              Shorts requires live Binance market data. Betting is disabled
+              until the feed reconnects.
             </Text>
             {priceFeedError ? (
               <Text className="text-text-subtle text-xs">{priceFeedError}</Text>
-            ) : null}
-            {oracleError ? (
-              <Text className="text-text-subtle text-xs">{oracleError}</Text>
             ) : null}
           </View>
         )}
@@ -999,19 +967,181 @@ export default function HomeScreen() {
             onMomentumScrollEnd={handleMarketScrollEnd}
             scrollEventThrottle={16}
           >
-            {SHORTS_MARKETS.map((market) => {
+            {SHORTS_MARKETS.map((market, marketIndex) => {
               const round = rounds[market.key];
-              const tone = getMarketTone(market.asset);
+              const tone = getMarketTone(marketIndex);
               const quoteSnapshot = marketQuoteSnapshots[market.key];
-              const chainlinkReference =
-                chainlinkOraclePrices[market.asset]?.price ?? null;
-              const liveSpotPrice = prices[market.symbol]?.price ?? null;
-              const marketPrice =
-                liveSpotPrice ?? chainlinkReference ?? round.openPrice;
+              const spotPrice = prices[market.symbol]?.price ?? null;
+              const marketPrice = spotPrice ?? round.openPrice;
               const upQuote = quoteSnapshot?.up ?? 0.5;
               const downQuote = quoteSnapshot?.down ?? 0.5;
               const roundVolume =
                 (quoteSnapshot?.upStake ?? 0) + (quoteSnapshot?.downStake ?? 0);
+              const sourceHistory = livePriceHistory[market.symbol] ?? [];
+              const rawHistory = sourceHistory.map((point) => ({
+                timestamp: point.updatedAt,
+                price: point.price,
+              }));
+              const priceHistoryFull =
+                rawHistory.length > 0
+                  ? rawHistory
+                  : typeof marketPrice === "number"
+                    ? [{ timestamp: now, price: marketPrice }]
+                    : [];
+              const chartWindowStart = now - CHART_WINDOW_MS;
+              const preWindowPoint = rawHistory
+                .filter((point) => point.timestamp < chartWindowStart)
+                .sort(
+                  (firstPoint, secondPoint) =>
+                    secondPoint.timestamp - firstPoint.timestamp,
+                )[0];
+              const windowedPriceHistory = priceHistoryFull.filter(
+                (point) =>
+                  point.timestamp >= chartWindowStart && point.timestamp <= now,
+              );
+              const baseHistory =
+                windowedPriceHistory.length > 0
+                  ? [
+                      ...(preWindowPoint
+                        ? [
+                            {
+                              timestamp: chartWindowStart,
+                              price: preWindowPoint.price,
+                            },
+                          ]
+                        : []),
+                      ...windowedPriceHistory,
+                    ]
+                  : typeof marketPrice === "number"
+                    ? [{ timestamp: now, price: marketPrice }]
+                    : [];
+              const filledHistory = buildWindowSeries(
+                baseHistory,
+                chartWindowStart,
+                now,
+                CHART_SAMPLE_MS,
+              );
+              const chartHistory =
+                filledHistory.length > 0 && typeof marketPrice === "number"
+                  ? [
+                      ...filledHistory.slice(0, -1),
+                      { timestamp: now, price: marketPrice },
+                    ]
+                  : filledHistory;
+              const chartValues = chartHistory.map((point) => point.price);
+              if (typeof round.openPrice === "number") {
+                chartValues.push(round.openPrice);
+              }
+              if (typeof marketPrice === "number") {
+                chartValues.push(marketPrice);
+              }
+              const baseMin =
+                chartValues.length > 0 ? Math.min(...chartValues) : 0;
+              const baseMax =
+                chartValues.length > 0 ? Math.max(...chartValues) : 1;
+              const flatRangePaddingBase = Math.max(
+                Math.abs(baseMin),
+                Math.abs(baseMax),
+                0.000001,
+              );
+              const chartPadding =
+                baseMax === baseMin
+                  ? flatRangePaddingBase * 0.002
+                  : (baseMax - baseMin) * 0.15;
+              const chartMin = baseMin - chartPadding;
+              const chartMax = baseMax + chartPadding;
+              const chartRange = chartMax - chartMin || 1;
+              const toChartX = (timestamp: number) =>
+                clamp(
+                  ((timestamp - chartWindowStart) / CHART_WINDOW_MS) *
+                    CHART_PLOT_WIDTH,
+                  0,
+                  CHART_PLOT_WIDTH,
+                );
+              const toChartY = (value: number) =>
+                ((chartMax - value) / chartRange) * CHART_VIEWBOX_HEIGHT;
+              const chartPoints = chartHistory.map((point) => ({
+                x: toChartX(point.timestamp),
+                y: toChartY(point.price),
+              }));
+              const chartPath = buildChartPath(chartPoints);
+              const latestChartPoint = chartPoints[chartPoints.length - 1];
+              const startLineY =
+                typeof round.openPrice === "number"
+                  ? toChartY(round.openPrice)
+                  : null;
+              const currentLineY =
+                typeof marketPrice === "number" ? toChartY(marketPrice) : null;
+              const arePriceLinesOverlapping =
+                startLineY !== null &&
+                currentLineY !== null &&
+                Math.abs(startLineY - currentLineY) < 2;
+              const startPriceLabelY =
+                startLineY === null
+                  ? null
+                  : clamp(
+                      startLineY + (arePriceLinesOverlapping ? -5 : 3),
+                      10,
+                      CHART_VIEWBOX_HEIGHT - 14,
+                    );
+              const currentPriceLabelY =
+                currentLineY === null
+                  ? null
+                  : clamp(
+                      currentLineY + (arePriceLinesOverlapping ? 8 : 3),
+                      10,
+                      CHART_VIEWBOX_HEIGHT - 14,
+                    );
+              const markerSlotTime =
+                Math.floor(now / CHART_TIME_MARKER_MS) * CHART_TIME_MARKER_MS;
+              const currentSlotAgeMs = now - markerSlotTime;
+              const movingMarkerLifespanMs =
+                CHART_WINDOW_MS - CHART_TIME_MARKER_MS;
+              const movingTimeMarkers: ChartTimeMarker[] = [];
+              for (
+                let markerTimestamp = markerSlotTime - CHART_TIME_MARKER_MS;
+                markerTimestamp >= chartWindowStart;
+                markerTimestamp -= CHART_TIME_MARKER_MS
+              ) {
+                const markerAgeMs = now - markerTimestamp;
+                if (
+                  markerAgeMs <= CHART_TIME_MARKER_MS ||
+                  movingMarkerLifespanMs <= 0
+                ) {
+                  continue;
+                }
+
+                const movementProgress = clamp(
+                  (markerAgeMs - CHART_TIME_MARKER_MS) / movingMarkerLifespanMs,
+                  0,
+                  1,
+                );
+                movingTimeMarkers.push({
+                  id: `moving-${markerTimestamp}`,
+                  x: CHART_PLOT_WIDTH * (1 - movementProgress),
+                  label: formatChartTime(markerTimestamp),
+                  textAnchor: "middle",
+                });
+              }
+              movingTimeMarkers.sort(
+                (firstMarker, secondMarker) => firstMarker.x - secondMarker.x,
+              );
+
+              const chartTimeMarkers: ChartTimeMarker[] = [
+                ...movingTimeMarkers,
+              ];
+              if (currentSlotAgeMs >= CHART_CURRENT_MARKER_DELAY_MS) {
+                chartTimeMarkers.push({
+                  id: `current-${markerSlotTime}`,
+                  x: CHART_PLOT_WIDTH,
+                  label: formatChartTime(markerSlotTime),
+                  textAnchor: "end",
+                });
+              }
+
+              if (chartTimeMarkers.length > 0) {
+                chartTimeMarkers[0].textAnchor = "start";
+              }
               const selectedAmount = DEFAULT_BET_AMOUNT;
               const roundTimeLeftMs = Math.max(0, round.endTime - now);
               const hasBetThisRound =
@@ -1039,12 +1169,14 @@ export default function HomeScreen() {
                         <TokenIcon size={28} />
                       </View>
                     </View>
-                    <View className="w-10 h-10 rounded-full bg-surface-hover border border-border items-center justify-center">
-                      <MaterialCommunityIcons
-                        name={market.asset === "BTC" ? "bitcoin" : "ethereum"}
-                        size={20}
-                        color={market.asset === "BTC" ? "#F59E0B" : "#60A5FA"}
-                      />
+                    <View
+                      className={`w-10 h-10 rounded-full border border-border items-center justify-center ${tone.accent}`}
+                    >
+                      <Text
+                        className={`text-[10px] font-semibold ${tone.text}`}
+                      >
+                        {market.asset}
+                      </Text>
                     </View>
                     <Text className="text-text font-semibold text-base">
                       {market.label}
@@ -1072,6 +1204,130 @@ export default function HomeScreen() {
                           ${formatPrice(round.openPrice)}
                         </Text>
                       </View>
+                    </View>
+
+                    <View className="h-36 rounded-lg bg-surface-hover/20 border border-border overflow-hidden">
+                      <Svg
+                        width="100%"
+                        height="100%"
+                        viewBox={`0 0 ${CHART_VIEWBOX_WIDTH} ${CHART_VIEWBOX_HEIGHT}`}
+                        preserveAspectRatio="none"
+                      >
+                        {chartTimeMarkers.map((marker) => (
+                          <Line
+                            key={`time-grid-${market.key}-${marker.id}`}
+                            x1={marker.x}
+                            y1={0}
+                            x2={marker.x}
+                            y2={CHART_VIEWBOX_HEIGHT}
+                            stroke="#27272A"
+                            strokeWidth={1}
+                            opacity={0.45}
+                          />
+                        ))}
+                        {startLineY !== null ? (
+                          <Line
+                            x1={0}
+                            y1={startLineY}
+                            x2={CHART_PLOT_WIDTH}
+                            y2={startLineY}
+                            stroke="#EF4444"
+                            strokeWidth={arePriceLinesOverlapping ? 1.8 : 1.5}
+                            strokeDasharray="6 6"
+                            opacity={0.9}
+                          />
+                        ) : null}
+                        {currentLineY !== null ? (
+                          <Line
+                            x1={0}
+                            y1={currentLineY}
+                            x2={CHART_PLOT_WIDTH}
+                            y2={currentLineY}
+                            stroke="#F59E0B"
+                            strokeWidth={arePriceLinesOverlapping ? 1.2 : 1.5}
+                            strokeDasharray={
+                              arePriceLinesOverlapping ? "3 6" : "6 6"
+                            }
+                            opacity={arePriceLinesOverlapping ? 0.85 : 0.9}
+                          />
+                        ) : null}
+                        {chartPath ? (
+                          <Path
+                            d={chartPath}
+                            stroke="#F59E0B"
+                            strokeWidth={2.2}
+                            fill="none"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        ) : null}
+                        {latestChartPoint ? (
+                          <Circle
+                            cx={latestChartPoint.x}
+                            cy={latestChartPoint.y}
+                            r={3.5}
+                            fill="#F59E0B"
+                          />
+                        ) : null}
+                        {/* Y-axis: top price */}
+                        <SvgText
+                          x={CHART_Y_LABEL_X}
+                          y={10}
+                          fill="#A1A1AA"
+                          fontSize={7}
+                          fontFamily="monospace"
+                        >
+                          {formatAxisPrice(chartMax)}
+                        </SvgText>
+                        {/* Y-axis: open price */}
+                        {startPriceLabelY !== null &&
+                        round.openPrice !== null ? (
+                          <SvgText
+                            x={CHART_Y_LABEL_X}
+                            y={startPriceLabelY}
+                            fill="#EF4444"
+                            fontSize={7}
+                            fontFamily="monospace"
+                          >
+                            {formatAxisPrice(round.openPrice)}
+                          </SvgText>
+                        ) : null}
+                        {/* Y-axis: current price */}
+                        {currentPriceLabelY !== null && marketPrice !== null ? (
+                          <SvgText
+                            x={CHART_Y_LABEL_X}
+                            y={currentPriceLabelY}
+                            fill="#F59E0B"
+                            fontSize={7}
+                            fontFamily="monospace"
+                          >
+                            {formatAxisPrice(marketPrice)}
+                          </SvgText>
+                        ) : null}
+                        {/* Y-axis: bottom price */}
+                        <SvgText
+                          x={CHART_Y_LABEL_X}
+                          y={CHART_VIEWBOX_HEIGHT - 4}
+                          fill="#A1A1AA"
+                          fontSize={7}
+                          fontFamily="monospace"
+                        >
+                          {formatAxisPrice(chartMin)}
+                        </SvgText>
+                        {chartTimeMarkers.map((marker) => (
+                          <SvgText
+                            key={`time-label-${market.key}-${marker.id}`}
+                            x={marker.x}
+                            y={CHART_VIEWBOX_HEIGHT - 4}
+                            fill="#71717A"
+                            fontSize={6.5}
+                            fontFamily="monospace"
+                            textAnchor={marker.textAnchor}
+                          >
+                            {marker.label}
+                          </SvgText>
+                        ))}
+                      </Svg>
                     </View>
 
                     <View className="flex-row items-center">
@@ -1152,134 +1408,81 @@ export default function HomeScreen() {
         </View>
 
         <View className="bg-surface border border-border rounded-2xl overflow-hidden">
-          <View className="px-4 py-3 border-b border-border flex-row items-center justify-between">
-            <Text className="text-text font-semibold">Open Positions</Text>
-            <Text className="text-text-subtle text-xs">
-              {openPositions.length} active
-            </Text>
-          </View>
+          <Pressable
+            onPress={() => setPositionsExpanded((prev) => !prev)}
+            className="px-4 py-3 border-b border-border flex-row items-center justify-between"
+          >
+            <View className="flex-row items-center gap-2">
+              <Text className="text-text font-semibold">Open Positions</Text>
+              <Text className="text-text-subtle text-xs">
+                {openPositions.length} active
+              </Text>
+            </View>
+            <Ionicons
+              name={positionsExpanded ? "chevron-up" : "chevron-down"}
+              size={18}
+              color="#A1A1AA"
+            />
+          </Pressable>
 
-          <View className="p-3 gap-2">
-            {sortedOpenPositions.length === 0 ? (
-              <View className="py-6 items-center">
-                <Text className="text-text-subtle text-sm">
-                  Place a position to start a shorts round
-                </Text>
-              </View>
-            ) : (
-              sortedOpenPositions.map((position) => {
-                const market = MARKET_BY_KEY[position.marketKey];
-                const secondsLeft = formatCountdown(
-                  position.roundEndTime - now,
-                );
-                return (
-                  <View
-                    key={position.id}
-                    className="bg-surface-hover/40 border border-border rounded-xl p-3"
-                  >
-                    <View className="flex-row items-center justify-between">
-                      <View className="flex-row items-center gap-2">
-                        <Text className="text-text font-semibold">
-                          {market.label}{" "}
-                          {position.direction === "up" ? "UP" : "DOWN"}
+          {positionsExpanded && (
+            <View className="p-3 gap-2">
+              {sortedOpenPositions.length === 0 ? (
+                <View className="py-6 items-center">
+                  <Text className="text-text-subtle text-sm">
+                    Place a position to start a shorts round
+                  </Text>
+                </View>
+              ) : (
+                sortedOpenPositions.map((position) => {
+                  const market = MARKET_BY_KEY[position.marketKey];
+                  const secondsLeft = formatCountdown(
+                    position.roundEndTime - now,
+                  );
+                  return (
+                    <View
+                      key={position.id}
+                      className="bg-surface-hover/40 border border-border rounded-xl p-3"
+                    >
+                      <View className="flex-row items-center justify-between">
+                        <View className="flex-row items-center gap-2">
+                          <Text className="text-text font-semibold">
+                            {market.label}{" "}
+                            {position.direction === "up" ? "UP" : "DOWN"}
+                          </Text>
+                          <Ionicons
+                            name={
+                              position.direction === "up"
+                                ? "trending-up"
+                                : "trending-down"
+                            }
+                            size={14}
+                            color={
+                              position.direction === "up"
+                                ? "#22C55E"
+                                : "#EF4444"
+                            }
+                          />
+                        </View>
+                        <Text className="text-text-subtle text-xs">
+                          Settles in {secondsLeft}
                         </Text>
-                        <Ionicons
-                          name={
-                            position.direction === "up"
-                              ? "trending-up"
-                              : "trending-down"
-                          }
-                          size={14}
-                          color={
-                            position.direction === "up" ? "#22C55E" : "#EF4444"
-                          }
-                        />
                       </View>
-                      <Text className="text-text-subtle text-xs">
-                        Settles in {secondsLeft}
-                      </Text>
+                      <View className="flex-row items-center justify-between mt-2">
+                        <Text className="text-text text-xs font-mono">
+                          Fill {formatContractPrice(position.entryQuote)} •{" "}
+                          {position.shares.toFixed(4)} shares
+                        </Text>
+                        <Text className="text-text-subtle text-xs">
+                          Cost {position.amount} TOK
+                        </Text>
+                      </View>
                     </View>
-                    <View className="flex-row items-center justify-between mt-2">
-                      <Text className="text-text text-xs font-mono">
-                        Fill {formatContractPrice(position.entryQuote)} •{" "}
-                        {position.shares.toFixed(4)} shares
-                      </Text>
-                      <Text className="text-text-subtle text-xs">
-                        Cost {position.amount} TOK
-                      </Text>
-                    </View>
-                  </View>
-                );
-              })
-            )}
-          </View>
-        </View>
-
-        <View className="bg-surface border border-border rounded-2xl overflow-hidden">
-          <View className="px-4 py-3 border-b border-border flex-row items-center justify-between">
-            <Text className="text-text font-semibold">Recent Settlements</Text>
-            <Text className="text-text-subtle text-xs">
-              Chainlink close • $1 payout/share
-            </Text>
-          </View>
-
-          <View className="p-3 gap-2">
-            {settledPositions.length === 0 ? (
-              <View className="py-5 items-center">
-                <Text className="text-text-subtle text-sm">
-                  No settlements yet
-                </Text>
-              </View>
-            ) : (
-              settledPositions.slice(0, 10).map((position) => {
-                const market = MARKET_BY_KEY[position.marketKey];
-                const statusColor =
-                  position.status === "win"
-                    ? "text-success"
-                    : position.status === "push"
-                      ? "text-warning"
-                      : "text-danger";
-
-                return (
-                  <View
-                    key={position.id}
-                    className="bg-surface-hover/40 border border-border rounded-xl p-3"
-                  >
-                    <View className="flex-row items-center justify-between">
-                      <Text className="text-text font-medium">
-                        {market.label} {position.direction.toUpperCase()}
-                      </Text>
-                      <Text
-                        className={`font-semibold uppercase text-xs ${statusColor}`}
-                      >
-                        {position.status}
-                      </Text>
-                    </View>
-
-                    <View className="flex-row items-center justify-between mt-2">
-                      <Text className="text-text-subtle text-xs">
-                        Fill {formatContractPrice(position.entryQuote)} • Open $
-                        {formatPrice(position.entryPrice)} / Close $
-                        {formatPrice(position.settlePrice)}
-                      </Text>
-                      <Text
-                        className={`text-sm font-mono ${
-                          position.profit > 0
-                            ? "text-success"
-                            : position.profit < 0
-                              ? "text-danger"
-                              : "text-text-subtle"
-                        }`}
-                      >
-                        {position.profit >= 0 ? "+" : ""}
-                        {position.profit.toFixed(2)} TOK
-                      </Text>
-                    </View>
-                  </View>
-                );
-              })
-            )}
-          </View>
+                  );
+                })
+              )}
+            </View>
+          )}
         </View>
       </ScrollView>
     </SafeAreaView>
